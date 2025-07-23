@@ -6,9 +6,12 @@ import sys, os, time, tempfile
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QPushButton, QFileDialog, QLabel,
     QProgressBar, QMessageBox, QHBoxLayout, QRadioButton,
-    QButtonGroup, QComboBox, QListWidget, QListWidgetItem, QSizePolicy
+    QButtonGroup, QComboBox, QListWidget, QListWidgetItem, QSizePolicy,
+    QCheckBox, # Import QCheckBox
+    QDialog, QDialogButtonBox # Import QDialog and QDialogButtonBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
+
 from PyQt6.QtGui import QIcon, QPixmap, QPainter, QFont
 from pdf2docx import Converter
 from docx import Document
@@ -42,6 +45,7 @@ class ConvertWorker(QThread):
     progress = pyqtSignal(int) # Emits overall progress (files or pages)
     page_progress = pyqtSignal(int) # Emits progress specifically for per-page mode
     result = pyqtSignal(list) # Emits a list of conversion results (success/failure)
+    canceled = pyqtSignal() # New signal emitted when conversion is canceled
 
     def __init__(self, files, output_folder, mode, fmt, direction):
         super().__init__()
@@ -51,6 +55,7 @@ class ConvertWorker(QThread):
         self.fmt = fmt # This will be 'docx', 'doc', or 'pdf'
         self.direction = direction # 'pdf_to_word' or 'word_to_pdf'
         self.total_steps = 0
+        self._is_canceled = False # Flag to indicate if conversion should be canceled
 
         # Calculate total steps for the progress bar based on the conversion mode and direction
         if self.direction == 'pdf_to_word' and self.mode == 'per_page':
@@ -63,11 +68,23 @@ class ConvertWorker(QThread):
         else:
             self.total_steps = len(self.files) # One step per file for normal mode or Word to PDF
 
+    def cancel(self):
+        """Sets the cancellation flag."""
+        self._is_canceled = True
+
     def run(self):
         """Performs the conversion in the background."""
         results = []
         current_step = 0
         for i, path in enumerate(self.files):
+            # The _is_canceled check is still relevant for gentle cancellation
+            # For forceful termination (PDF to Word), this loop will be abruptly stopped by terminate()
+            if self._is_canceled:
+                results.append("轉換已取消。")
+                self.canceled.emit()
+                self.result.emit(results)
+                return # Exit the run method
+
             name = os.path.splitext(os.path.basename(path))[0]
             
             if self.direction == 'pdf_to_word':
@@ -77,8 +94,9 @@ class ConvertWorker(QThread):
 
                 try:
                     if self.mode == 'normal':
-                        # Normal conversion: convert the whole PDF to one DOCX
                         converter = Converter(path)
+                        # The converter.convert() is the blocking part.
+                        # If terminate() is called, this line will be interrupted.
                         tmp_docx = dest_path if self.fmt == 'docx' else os.path.join(self.output_folder, name + '.docx')
                         converter.convert(tmp_docx, start=0, end=None)
                         converter.close()
@@ -87,15 +105,25 @@ class ConvertWorker(QThread):
                         self.progress.emit(current_step)
 
                     else: # 'per_page' mode (PDF to Word)
-                        # Per-page conversion: convert each page to a separate DOCX, then merge
                         temp_docs = []
                         reader = PdfReader(path)
                         page_count = len(reader.pages)
 
                         converter = Converter(path)
                         for p in range(page_count):
+                            if self._is_canceled: # This check allows gentle cancellation between pages
+                                # Clean up partial temp files if conversion is canceled mid-page
+                                for td in temp_docs:
+                                    if os.path.exists(td):
+                                        os.remove(td)
+                                results.append("轉換已取消。")
+                                self.canceled.emit()
+                                self.result.emit(results)
+                                converter.close()
+                                return # Exit the run method
+
                             tmp = os.path.join(tempfile.gettempdir(), f"{name}_p{p}.docx")
-                            converter.convert(tmp, start=p, end=p+1)
+                            converter.convert(tmp, start=p, end=p+1) # This is blocking per page
                             temp_docs.append(tmp)
                             current_step += 1
                             self.progress.emit(current_step)
@@ -114,25 +142,33 @@ class ConvertWorker(QThread):
 
                     # If output format is 'doc' and win32com is available, convert DOCX to DOC
                     if self.fmt == 'doc' and win32com:
-                        word = win32com.client.Dispatch('Word.Application')
-                        word.Visible = False
-                        doc = word.Documents.Open(tmp_docx)
-                        doc.SaveAs(dest_path, FileFormat=0) # FileFormat=0 saves as Word Document (.doc)
-                        doc.Close()
-                        word.Quit()
+                        word = None # Initialize to None
+                        try:
+                            word = win32com.client.Dispatch('Word.Application')
+                            word.Visible = False
+                            doc = word.Documents.Open(tmp_docx)
+                            doc.SaveAs(dest_path, FileFormat=0) # FileFormat=0 saves as Word Document (.doc)
+                            doc.Close()
+                        finally: # Ensure word.Quit() is called
+                            if word:
+                                word.Quit()
                         if os.path.exists(tmp_docx) and dest_path != tmp_docx:
                             os.remove(tmp_docx) # Remove the intermediate .docx file
 
                     results.append(f"✅ {out_name}")
                 except Exception as e:
                     results.append(f"❌ {out_name} - 失敗：{e}")
-                    # Ensure progress is updated even on failure for overall count
                     if self.mode == 'normal':
                         current_step += 1
                         self.progress.emit(current_step)
-                    # For per_page, progress is updated per page, so no extra update here
 
             elif self.direction == 'word_to_pdf':
+                if self._is_canceled:
+                    results.append("轉換已取消。")
+                    self.canceled.emit()
+                    self.result.emit(results)
+                    return # Exit the run method
+
                 out_name = name + ".pdf"
                 dest_path = os.path.join(self.output_folder, out_name)
                 
@@ -142,28 +178,68 @@ class ConvertWorker(QThread):
                     self.progress.emit(current_step)
                     continue
 
+                word = None # Initialize to None
                 try:
                     word = win32com.client.Dispatch("Word.Application")
                     word.Visible = False # Keep Word application hidden
                     doc = word.Documents.Open(path)
-                    # FileFormat=17 is wdFormatPDF
-                    doc.SaveAs(dest_path, FileFormat=17)
+                    doc.SaveAs(dest_path, FileFormat=17) # FileFormat=17 is wdFormatPDF
                     doc.Close()
-                    word.Quit()
-                    results.append(f"✅ {out_name}")
                 except Exception as e:
                     results.append(f"❌ {out_name} - 失敗：{e}")
                 finally:
                     current_step += 1
                     self.progress.emit(current_step)
-                    # Ensure Word process is closed even if an error occurs
-                    try:
+                    if word: # Ensure Word process is closed even if an error occurs
                         word.Quit()
-                    except Exception:
-                        pass # Already closed or not initialized
 
-        self.progress.emit(self.total_steps) # Ensure progress bar reaches 100%
-        self.result.emit(results)
+        if not self._is_canceled: # Only emit full progress and result if not canceled
+            self.progress.emit(self.total_steps) # Ensure progress bar reaches 100%
+            self.result.emit(results)
+
+class CancelConfirmationDialog(QDialog):
+    """Custom dialog for cancel confirmation with three options: Yes, Yes (Forceful), No."""
+    def __init__(self, parent=None, message="", show_force_option_button=True):
+        super().__init__(parent)
+        self.setWindowTitle("確認取消")
+        self.setModal(True)
+        self._user_choice = 0 # 0: No, 1: Yes (gentle), 2: Yes (forceful)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(10)
+
+        self.message_label = QLabel(message)
+        self.message_label.setWordWrap(True)
+        layout.addWidget(self.message_label)
+
+        button_layout = QHBoxLayout()
+
+        self.yes_button = QPushButton("是")
+        self.yes_button.clicked.connect(lambda: self._set_choice_and_accept(1))
+        button_layout.addWidget(self.yes_button)
+
+        if show_force_option_button: # Only show forceful button if enabled
+            self.force_yes_button = QPushButton("是 (強制終止)")
+            self.force_yes_button.clicked.connect(lambda: self._set_choice_and_accept(2))
+            button_layout.addWidget(self.force_yes_button)
+        else:
+            self.force_yes_button = None
+
+        self.no_button = QPushButton("否")
+        self.no_button.clicked.connect(lambda: self._set_choice_and_accept(0))
+        button_layout.addWidget(self.no_button)
+
+        layout.addLayout(button_layout)
+
+    def _set_choice_and_accept(self, choice):
+        self._user_choice = choice
+        self.accept() # Call accept to close the dialog
+
+    def get_user_choice(self):
+        """Returns the user's choice: 0 for No, 1 for Yes (gentle), 2 for Yes (forceful)."""
+        return self._user_choice
+
 
 class PDFConverterApp(QWidget):
     """Main application window for the PDF to Word converter."""
@@ -179,6 +255,7 @@ class PDFConverterApp(QWidget):
         self.convert_total_time = 0
         self.current_page_progress = 0
         self.total_pages = 0
+        self.worker = None # Reference to the conversion worker thread
         self.init_ui()
         self.setAcceptDrops(True) # Enable drag and drop
         self.apply_light_theme() # Apply initial theme
@@ -292,7 +369,7 @@ class PDFConverterApp(QWidget):
         layout.addWidget(self.status)
         layout.addWidget(self.progress)
 
-        # Control buttons (Convert, Open Folder, Show Progress)
+        # Control buttons (Convert, Open Folder, Show Progress, Cancel)
         ctrl_btns = QHBoxLayout()
         self.convert_btn = QPushButton("🚀 開始轉換")
         self.convert_btn.clicked.connect(self.convert_files)
@@ -308,7 +385,17 @@ class PDFConverterApp(QWidget):
         self.show_progress_btn.clicked.connect(self.show_progress_dialog)
         ctrl_btns.addWidget(self.show_progress_btn)
 
+        self.cancel_btn = QPushButton("❌ 取消轉換") # New Cancel button
+        self.cancel_btn.clicked.connect(self.cancel_conversion)
+        self.cancel_btn.setEnabled(False) # Disabled until conversion starts
+        ctrl_btns.addWidget(self.cancel_btn)
+
         layout.addLayout(ctrl_btns)
+
+        # Removed the forceful cancel checkbox from here
+        # self.force_cancel_checkbox = QCheckBox("強制取消 (可能損壞檔案)")
+        # self.force_cancel_checkbox.setChecked(False) # Default to gentle cancel
+        # layout.addWidget(self.force_cancel_checkbox)
 
         # Initial UI update based on default direction
         self.update_ui_for_direction()
@@ -321,8 +408,8 @@ class PDFConverterApp(QWidget):
         is_pdf_to_word = self.pdf_to_word_rb.isChecked()
         
         # ==================== FIX START ====================
-        # Enable/disable the PDF-to-Word specific widgets instead of hiding them.
-        # This prevents layout corruption issues.
+        # Enable/disable the PDF-to-Word specific widgets into a list to enable/disable them together.
+        # This is a robust way to avoid layout issues caused by hiding/showing widgets.
         for widget in self.pdf_mode_widgets:
             widget.setEnabled(is_pdf_to_word)
         # ===================== FIX END =====================
@@ -507,6 +594,8 @@ class PDFConverterApp(QWidget):
 
         self.progress.setValue(0)
         self.open_btn.setEnabled(False)
+        self.convert_btn.setEnabled(False) # Disable convert button during conversion
+        self.cancel_btn.setEnabled(True) # Enable cancel button during conversion
         self.status.setText("🔄 正在轉換中... 請稍候")
 
         self.convert_start_time = time.time()
@@ -525,6 +614,7 @@ class PDFConverterApp(QWidget):
         self.worker.page_progress.connect(self.update_current_page_progress)
 
         self.worker.result.connect(self.convert_finished)
+        self.worker.canceled.connect(self.conversion_canceled) # Connect new canceled signal
         self.worker.start()
 
     def update_current_page_progress(self, val):
@@ -539,6 +629,59 @@ class PDFConverterApp(QWidget):
         else:
             QMessageBox.information(self, "逐頁轉換進度", "目前非逐頁模式，或尚未開始轉換。")
 
+    def cancel_conversion(self):
+        """Handles the cancellation of the conversion process."""
+        if self.worker and self.worker.isRunning():
+            current_direction = 'pdf_to_word' if self.pdf_to_word_rb.isChecked() else 'word_to_pdf'
+
+            dialog_message = "您確定要取消目前的轉換嗎？"
+            
+            # Determine if the forceful option button should be shown
+            show_force_option_button_in_dialog = (current_direction == 'pdf_to_word')
+
+            dialog = CancelConfirmationDialog(self, dialog_message, show_force_option_button=show_force_option_button_in_dialog)
+            
+            # Execute the dialog and get the result
+            dialog_result_code = dialog.exec() # This will be QDialog.Accepted or QDialog.Rejected
+            user_choice = dialog.get_user_choice() # This will be 0, 1, or 2
+
+            if dialog_result_code == QDialog.DialogCode.Accepted: # User clicked Yes or Yes (Forceful)
+                if user_choice == 2: # Yes (Forceful Termination)
+                    self.status.setText("🛑 正在強制終止轉換...")
+                    self.cancel_btn.setEnabled(False) # Disable cancel button immediately
+                    
+                    # Forcefully terminate the worker thread
+                    self.worker.terminate()
+                    self.worker.wait() # Wait for the thread to actually terminate
+
+                    # Directly reset UI after forceful termination
+                    self._reset_ui_after_forceful_cancel()
+                    QMessageBox.information(self, "轉換取消", "轉換已強制中止。")
+                elif user_choice == 1: # Yes (Gentle Cancellation)
+                    self.worker.cancel()
+                    self.status.setText("🛑 正在取消轉換... 請等待目前檔案/頁面完成。")
+                    self.cancel_btn.setEnabled(False) # Disable cancel button immediately
+            # If dialog_result_code is Rejected (user clicked No or closed dialog), do nothing.
+
+    def _reset_ui_after_forceful_cancel(self):
+        """Resets UI elements after a forceful cancellation."""
+        self.progress.setValue(0)
+        self.convert_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self.open_btn.setEnabled(False)
+        self.show_progress_btn.setEnabled(False)
+        self.update_file_count_status() # Reset status to show file count
+
+    def conversion_canceled(self):
+        """Called when the conversion worker thread is gently canceled."""
+        self.status.setText("🛑 轉換已取消。")
+        self.progress.setValue(0) # Reset progress bar
+        self.convert_btn.setEnabled(True) # Re-enable convert button
+        self.cancel_btn.setEnabled(False) # Ensure cancel button is disabled
+        self.open_btn.setEnabled(False)
+        self.show_progress_btn.setEnabled(False)
+        QMessageBox.information(self, "轉換取消", "取消完成。")
+
     def convert_finished(self, results):
         """Called when the conversion worker thread finishes."""
         if self.convert_start_time is not None:
@@ -549,6 +692,8 @@ class PDFConverterApp(QWidget):
         self.status.setText("✅ 所有轉換已完成！")
         QMessageBox.information(self, "轉換結果", "\n".join(results))
         self.open_btn.setEnabled(True)
+        self.convert_btn.setEnabled(True) # Re-enable convert button
+        self.cancel_btn.setEnabled(False) # Ensure cancel button is disabled
         self.progress.setValue(self.progress.maximum()) # Ensure progress bar is full
 
     def open_folder(self):
@@ -653,7 +798,7 @@ class PDFConverterApp(QWidget):
             }
             QComboBox::down-arrow {
                 /* Updated SVG with blue fill color */
-                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iOCIgdmlld0JveD0iMCAwIDEyIDgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIgMmg4bC00IDQiIGZpbGw9IiM0YTkwZTIiLz48L3N2Zz4=);
+                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iOCIgdmlld0JveD0iMCAwIDEyIDgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIgMmg4bC00IDQiIGZpbGw9IiM0YTkwZTIiLz48L2x2Zz4=);
                 width: 12px;
                 height: 8px;
             }
@@ -805,7 +950,7 @@ class PDFConverterApp(QWidget):
             }
             QComboBox::down-arrow {
                 /* Updated SVG with blue fill color */
-                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iOCIgdmlld0JveD0iMCAwIDEyIDgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIgMmg4bC00IDQiIGZpbGw9IiMyOWI2ZjYiLz48L3N2Zz4=);
+                image: url(data:image/svg+xml;base64,PHN2ZyB3aWR0aD0iMTIiIGhlaWdodD0iOCIgdmlld0JveD0iMCAwIDEyIDgiIHhtbG5zPSJodHRwOi8vd3d3LnczLm9yZy8yMDAwL3N2ZyI+PHBhdGggZD0iTTIgMmg4bC00IDQiIGZpbGw9IiMyOWI2ZjYiLz48L2x2Zz4=);
                 width: 12px;
                 height: 8px;
             }
