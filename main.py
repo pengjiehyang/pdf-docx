@@ -1,3 +1,5 @@
+# --- START OF FILE main.py ---
+
 import sys, os, time, tempfile
 # Removed subprocess as terminal functionality is removed
 
@@ -77,7 +79,7 @@ class ConvertWorker(QThread):
                     if self.mode == 'normal':
                         # Normal conversion: convert the whole PDF to one DOCX
                         converter = Converter(path)
-                        tmp_docx = dest_path if self.fmt == 'docx' else dest_path + '.docx'
+                        tmp_docx = dest_path if self.fmt == 'docx' else os.path.join(self.output_folder, name + '.docx')
                         converter.convert(tmp_docx, start=0, end=None)
                         converter.close()
 
@@ -118,7 +120,7 @@ class ConvertWorker(QThread):
                         doc.SaveAs(dest_path, FileFormat=0) # FileFormat=0 saves as Word Document (.doc)
                         doc.Close()
                         word.Quit()
-                        if self.fmt == 'doc' and os.path.exists(tmp_docx):
+                        if os.path.exists(tmp_docx) and dest_path != tmp_docx:
                             os.remove(tmp_docx) # Remove the intermediate .docx file
 
                     results.append(f"✅ {out_name}")
@@ -206,18 +208,29 @@ class PDFConverterApp(QWidget):
 
         # Connect direction change to update UI
         self.pdf_to_word_rb.toggled.connect(self.update_ui_for_direction)
-        self.word_to_pdf_rb.toggled.connect(self.update_ui_for_direction)
+
+        # ==================== FIX START ====================
+        # Group PDF-to-Word specific widgets into a list to enable/disable them together.
+        # This is a robust way to avoid layout issues caused by hiding/showing widgets.
+        self.pdf_mode_widgets = []
 
         # Conversion Mode selection (Only for PDF to Word)
-        layout.addWidget(QLabel("選擇轉換模式 (僅限 PDF 轉 Word):"))
+        mode_label = QLabel("選擇轉換模式 (僅限 PDF 轉 Word):")
+        layout.addWidget(mode_label)
+        self.pdf_mode_widgets.append(mode_label)
+        
         self.mode_group = QButtonGroup(self)
         self.normal_rb = QRadioButton("正常模式 (將 PDF 轉換為單一 Word 檔案)")
         self.perpage_rb = QRadioButton("逐頁模式 (將 PDF 逐頁轉換後合併為單一 Word 檔案)")
         self.normal_rb.setChecked(True)
         self.mode_group.addButton(self.normal_rb)
         self.mode_group.addButton(self.perpage_rb)
+        
         layout.addWidget(self.normal_rb)
         layout.addWidget(self.perpage_rb)
+        self.pdf_mode_widgets.append(self.normal_rb)
+        self.pdf_mode_widgets.append(self.perpage_rb)
+        # ===================== FIX END =====================
         
         # Output Format selection (Horizontal layout)
         output_format_layout = QHBoxLayout()
@@ -304,10 +317,18 @@ class PDFConverterApp(QWidget):
 
     def update_ui_for_direction(self):
         """Updates UI elements based on the selected conversion direction."""
-        if self.pdf_to_word_rb.isChecked():
+        # Check which radio button is checked to determine the state
+        is_pdf_to_word = self.pdf_to_word_rb.isChecked()
+        
+        # ==================== FIX START ====================
+        # Enable/disable the PDF-to-Word specific widgets instead of hiding them.
+        # This prevents layout corruption issues.
+        for widget in self.pdf_mode_widgets:
+            widget.setEnabled(is_pdf_to_word)
+        # ===================== FIX END =====================
+
+        if is_pdf_to_word:
             # PDF to Word selected
-            self.normal_rb.setVisible(True)
-            self.perpage_rb.setVisible(True)
             self.output_format_label.setText("選擇輸出格式:")
             self.format_combo.clear()
             self.format_combo.addItems(["docx", "doc"])
@@ -315,8 +336,6 @@ class PDFConverterApp(QWidget):
             self.show_progress_btn.setEnabled(self.perpage_rb.isChecked()) # Only if per-page is also selected
         else:
             # Word to PDF selected
-            self.normal_rb.setVisible(False)
-            self.perpage_rb.setVisible(False)
             self.output_format_label.setText("輸出格式: PDF (自動)")
             self.format_combo.clear() # Clear existing items
             self.format_combo.addItem("pdf") # Add "pdf" as the only option
@@ -383,7 +402,7 @@ class PDFConverterApp(QWidget):
                 self.file_list_widget.addItem(item)
                 added_count += 1
         self.update_file_count_status()
-        if added_count > 0:
+        if added_count > 0 and self.isVisible(): # Check if window is visible to avoid message on startup
             QMessageBox.information(self, "檔案選擇", f"已新增 {added_count} 個新檔案。")
 
     def remove_selected_files(self):
@@ -576,6 +595,9 @@ class PDFConverterApp(QWidget):
                 margin-bottom: 2px;
                 font-weight: bold;
             }
+            QLabel:disabled {
+                color: #aaaaaa;
+            }
             QPushButton {
                 border-radius: 20px; /* Larger radius for buttons */
                 padding: 10px 20px; /* Larger padding for buttons */
@@ -647,6 +669,9 @@ class PDFConverterApp(QWidget):
                 font-weight: bold;
                 color: #333333;
                 margin-bottom: 5px;
+            }
+            QRadioButton:disabled {
+                color: #aaaaaa;
             }
             QListWidget {
                 border: 2px solid #4a90e2;
@@ -722,6 +747,9 @@ class PDFConverterApp(QWidget):
                 margin-bottom: 2px;
                 font-weight: bold;
             }
+            QLabel:disabled {
+                color: #777777;
+            }
             QPushButton {
                 border-radius: 20px; /* Larger radius for buttons */
                 padding: 10px 20px; /* Larger padding for buttons */
@@ -793,6 +821,9 @@ class PDFConverterApp(QWidget):
                 font-weight: bold;
                 color: #eeeeee;
                 margin-bottom: 5px;
+            }
+            QRadioButton:disabled {
+                color: #777777;
             }
             QListWidget {
                 border: 2px solid #555;
